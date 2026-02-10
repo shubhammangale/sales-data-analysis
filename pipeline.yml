@@ -1,0 +1,157 @@
+name: Sales Analysis CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 6 * * 1'   # Run every Monday at 6 AM UTC
+
+jobs:
+  # ── Job 1: Lint & Test ────────────────────────────────────────────────────
+  lint-and-test:
+    name: Lint & Unit Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install flake8 pytest pytest-cov
+
+      - name: Lint with flake8
+        run: |
+          flake8 src/ --max-line-length=110 --ignore=E501,W503 --statistics
+
+      - name: Run unit tests
+        run: |
+          pytest tests/ -v --cov=src --cov-report=xml --cov-report=term-missing
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+  # ── Job 2: Full Pipeline ──────────────────────────────────────────────────
+  run-pipeline:
+    name: Run Full Analysis Pipeline
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run end-to-end pipeline
+        run: python src/main.py
+
+      - name: Validate outputs exist
+        run: |
+          test -f outputs/sales_master.csv       && echo "✓ sales_master.csv"
+          test -f outputs/analysis_results.json  && echo "✓ analysis_results.json"
+          ls outputs/images/*.png | wc -l | xargs -I{} sh -c 'test {} -ge 8 && echo "✓ {} charts generated"'
+
+      - name: Upload pipeline outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-outputs-${{ github.run_number }}
+          path: |
+            outputs/sales_master.csv
+            outputs/analysis_results.json
+            outputs/images/
+
+      - name: Show analysis summary
+        run: |
+          python -c "
+          import json
+          with open('outputs/analysis_results.json') as f:
+              r = json.load(f)
+          print('=== Analysis Summary ===')
+          print(f'Total Revenue:    \${r[\"total_revenue\"]:,.2f}')
+          print(f'Total Orders:     {r[\"total_orders\"]:,}')
+          print(f'Avg Order Value:  \${r[\"avg_order_value\"]:,.2f}')
+          print(f'Q4 Growth vs Q3: +{r[\"quarterly\"][\"q4_vs_q3_growth_pct\"]}%')
+          print(f'Return Rate:      {r[\"returns\"][\"overall_return_rate_pct\"]}%')
+          top3 = r['categories']['top3_categories']
+          print('Top 3 Categories:')
+          for i, c in enumerate(top3, 1):
+              print(f'  #{i} {c[\"category\"]} - \${c[\"total_revenue\"]:,.0f}')
+          "
+
+  # ── Job 3: Quality Gate ───────────────────────────────────────────────────
+  quality-gate:
+    name: Data Quality Gate
+    runs-on: ubuntu-latest
+    needs: run-pipeline
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download pipeline outputs
+        uses: actions/download-artifact@v4
+        with:
+          name: pipeline-outputs-${{ github.run_number }}
+          path: outputs/
+
+      - name: Run quality checks
+        run: |
+          python -c "
+          import pandas as pd, json, sys
+
+          # Check 1: Row count
+          df = pd.read_csv('outputs/sales_master.csv')
+          assert len(df) >= 10000, f'Expected >= 10k rows, got {len(df)}'
+          print(f'✓ Row count: {len(df):,}')
+
+          # Check 2: No nulls in key columns
+          nulls = df[['date','revenue','category','region']].isnull().sum()
+          assert nulls.sum() == 0, f'Found nulls: {nulls[nulls>0]}'
+          print('✓ No nulls in key columns')
+
+          # Check 3: Revenue is positive
+          assert (df['revenue'] > 0).all(), 'Found non-positive revenue'
+          print('✓ All revenue values positive')
+
+          # Check 4: Q4 growth flag
+          with open('outputs/analysis_results.json') as f:
+              r = json.load(f)
+          growth = r['quarterly']['q4_vs_q3_growth_pct']
+          assert growth > 0, f'Expected Q4 growth, got {growth}%'
+          print(f'✓ Q4 growth confirmed: +{growth}%')
+
+          print()
+          print('All quality checks passed!')
+          "
